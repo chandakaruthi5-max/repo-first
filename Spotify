@@ -1,0 +1,537 @@
+{
+  "name":"spotify-sync-server",
+  "version":"1.0.0",
+  "type":"module",
+  "scripts":{
+    "dev":"nodemon index.js",
+    "start":"node index.js"
+  },
+  "dependencies":{
+    "axios":"^1.4.0",
+    "cors":"^2.8.5",
+    "express":"^4.18.2",
+    "socket.io":"^4.7.1",
+    "dotenv":"^16.0.0"
+  },
+  "devDependencies":{"nodemon":"^2.0.22"}
+}SPOTIFY_CLIENT_ID=your_spotify_client_id
+SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
+REDIRECT_URI=http://localhost:8888/callback
+FRONTEND_URI=http://localhost:3000
+PORT=8888
+import express from 'express';
+import http from 'http';
+import { Server } from 'socket.io';
+import cors from 'cors';
+import axios from 'axios';
+import dotenv from 'dotenv';
+dotenv.config();
+
+const {
+  SPOTIFY_CLIENT_ID,
+  SPOTIFY_CLIENT_SECRET,
+  REDIRECT_URI,
+  FRONTEND_URI,
+  PORT = 8888
+} = process.env;
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: FRONTEND_URI } });
+
+/* ------------------ Simple OAuth flow endpoints ------------------ */
+/* 1) Redirect user to Spotify to authorize */
+app.get('/login', (req, res) => {
+  const scope = [
+    'streaming',
+    'user-read-email',
+    'user-read-private',
+    'user-read-playback-state',
+    'user-modify-playback-state'
+  ].join(' ');
+  const url = 'https://accounts.spotify.com/authorize' +
+    `?response_type=code&client_id=${SPOTIFY_CLIENT_ID}` +
+    `&scope=${encodeURIComponent(scope)}` +
+    `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
+  res.redirect(url);
+});
+
+/* 2) Callback - exchange code for tokens and redirect to frontend with tokens in query (simple demo) */
+app.get('/callback', async (req, res) => {
+  const code = req.query.code || null;
+  try {
+    const body = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: REDIRECT_URI,
+      client_id: SPOTIFY_CLIENT_ID,
+      client_secret: SPOTIFY_CLIENT_SECRET
+    });
+    const tokenRes = await axios.post('https://accounts.spotify.com/api/token', body.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    });
+    const { access_token, refresh_token, expires_in } = tokenRes.data;
+    // Redirect to frontend and provide tokens (for hackathon demo only - in prod store server-side)
+    const redirect = `${FRONTEND_URI}/?access_token=${access_token}&refresh_token=${refresh_token}&expires_in=${expires_in}`;
+    res.redirect(redirect);
+  } catch (err) {
+    console.error('callback err', err?.response?.data || err.message);
+    res.status(500).send('Auth failed');
+  }
+});
+
+/* 3) Refresh token endpoint */
+app.post('/refresh', async (req, res) => {
+  const { refresh_token } = req.body;
+  try {
+    const body = new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token,
+      client_id: SPOTIFY_CLIENT_ID,
+      client_secret: SPOTIFY_CLIENT_SECRET
+    });
+    const tokenRes = await axios.post('https://accounts.spotify.com/api/token', body.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    });
+    res.json(tokenRes.data);
+  } catch (err) {
+    res.status(500).json({ error: 'refresh_failed', details: err?.response?.data || err.message });
+  }
+});
+
+/* ------------------ Socket.IO room sync (in-memory simple) ------------------ */
+const rooms = {}; // { roomId: { hostSocketId, clients: Set } }
+
+io.on('connection', socket => {
+  console.log('sock conn', socket.id);
+
+  socket.on('create_room', ({ roomId }) => {
+    rooms[roomId] = { hostSocketId: socket.id, clients: new Set([socket.id]) };
+    socket.join(roomId);
+    socket.emit('room_created', { roomId });
+    console.log('room created', roomId);
+  });
+
+  socket.on('join_room', ({ roomId }) => {
+    if (!rooms[roomId]) rooms[roomId] = { clients: new Set() };
+    rooms[roomId].clients.add(socket.id);
+    socket.join(roomId);
+    socket.emit('joined_room', { roomId });
+    console.log('joined room', roomId);
+    // If host exists, tell them a new peer joined (optional)
+    const hostId = rooms[roomId].hostSocketId;
+    if (hostId && hostId !== socket.id) io.to(hostId).emit('peer_joined', { socketId: socket.id });
+  });
+
+  socket.on('host_update', ({ roomId, trackId, progress_ms, isPlaying, ts }) => {
+    // Relay to all others in room
+    socket.to(roomId).emit('sync_update', { trackId, progress_ms, isPlaying, ts });
+  });
+
+  socket.on('control_command', ({ roomId, cmd, payload }) => {
+    io.in(roomId).emit('control_command', { cmd, payload });
+  });
+
+  socket.on('disconnect', () => {
+    // remove socket from rooms
+    Object.keys(rooms).forEach(r => {
+      rooms[r].clients.delete(socket.id);
+      if (rooms[r].hostSocketId === socket.id) {
+        // host left — pick a new host (naive)
+        const arr = Array.from(rooms[r].clients);
+        rooms[r].hostSocketId = arr[0] || null;
+        if (rooms[r].hostSocketId) io.to(rooms[r].hostSocketId).emit('you_are_now_host', { roomId: r });
+      }
+      if (rooms[r].clients.size === 0) delete rooms[r];
+    });
+    console.log('sock disconnect', socket.id);
+  });
+});
+
+server.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+{
+  "name":"spotify-sync-client",
+  "version":"1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "axios": "^1.4.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "socket.io-client": "^4.7.1"
+  },
+  "devDependencies": {import React, { useEffect, useState, useRef } from 'react';
+import io from 'socket.io-client';
+import axios from 'axios';
+
+/* configure */
+const SERVER = 'http://localhost:8888'; // server base
+const SOCKET_IO = 'http://localhost:8888'; // socket server origin
+
+function useQueryParams() {
+  const [params, setParams] = useState({});
+  useEffect(()=> {
+    const qs = new URLSearchParams(window.location.search);
+    const obj = {};
+    for (const [k,v] of qs.entries()) obj[k] = v;
+    setParams(obj);
+  }, []);
+  return params;
+}
+
+export default function App(){
+  const qp = useQueryParams();
+  const [accessToken, setAccessToken] = useState(qp.access_token || null);
+  const [refreshToken, setRefreshToken] = useState(qp.refresh_token || null);
+  const [roomId, setRoomId] = useState('');
+  const [joinedRoom, setJoinedRoom] = useState(null);
+  const [isHost, setIsHost] = useState(false);
+  const socketRef = useRef(null);
+  const playerRef = useRef(null);
+  const [status, setStatus] = useState('idle');
+  const [currentTrack, setCurrentTrack] = useState(null);
+
+  useEffect(()=> {
+    if (!socketRef.current) socketRef.current = io(SOCKET_IO);
+    const sock = socketRef.current;
+    sock.on('room_created', d => setJoinedRoom(d.roomId));
+    sock.on('joined_room', d => setJoinedRoom(d.roomId));
+    sock.on('sync_update', async ({ trackId, progress_ms, isPlaying, ts }) => {
+      // simple best-effort: use Web API to play/seek if token available
+      if (!accessToken) return;
+      try {
+        // If different track, start playing that track for this user
+        // Start playing the track on user's active device (or default device)
+        await axios.put(`https://api.spotify.com/v1/me/player/play`, 
+          { uris: [`spotify:track:${trackId}`], position_ms: progress_ms },
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        ).catch(()=>{}); // best-effort (some accounts/devices might not allow)
+      } catch (err) {
+        console.log('sync play failed', err?.response?.data || err.message);
+      }
+    });
+    return ()=> { sock.disconnect(); socketRef.current = null; };
+  }, [accessToken]);
+
+  /* Web Playback SDK loader + player init */
+  useEffect(()=> {
+    if (!accessToken) return;
+    const script = document.createElement('script');
+    script.src = "https://sdk.scdn.co/spotify-player.js";
+    script.async = true;
+    document.body.appendChild(script);
+
+    window.onSpotifyWebPlaybackSDKReady = () => {
+      const player = new window.Spotify.Player({
+        name: 'Hackathon Shared Room Player',
+        getOAuthToken: cb => { cb(accessToken); },
+        volume: 0.6
+      });
+      playerRef.current = player;
+
+      player.addListener('ready', ({ device_id }) => {
+        console.log('ready device_id', device_id);
+        setStatus('device_ready');
+        // Note: In demo we don't auto transfer — user can open Spotify and play
+      });
+
+      player.addListener('player_state_changed', state => {
+        if (!state) return;
+        const track = state.track_window.current_track;
+        setCurrentTrack({ id: track.id, name: track.name, artists: track.artists.map(a=>a.name).join(',') });
+      });
+
+      player.connect();
+    };
+
+    return () => {
+      // cleanup script if needed
+    };
+  }, [accessToken]);
+
+  useEffect(()=> {
+    // if this client is host, emit host updates periodically
+    let iv;
+    if (isHost && socketRef.current && playerRef.current) {
+      iv = setInterval(async ()=> {
+        try {
+          const state = await playerRef.current.getCurrentState();
+          if (!state) return;
+          const track = state.track_window.current_track;
+          socketRef.current.emit('host_update', {
+            roomId: joinedRoom,
+            trackId: track.id,
+            progress_ms: state.position,
+            isPlaying: !state.paused,
+            ts: Date.now()
+          });
+        } catch (e) {
+          // ignore
+        }
+      }, 1000);
+    }
+    return ()=> clearInterval(iv);
+  }, [isHost, joinedRoom]);
+
+  const doLogin = () => window.location.href = `${SERVER}/login`;
+
+  const createRoom = () => {
+    if (!socketRef.current) socketRef.current = io(SOCKET_IO);
+    const code = Math.random().toString(36).slice(2,8).toUpperCase();
+    setIsHost(true);
+    socketRef.current.emit('create_room', { roomId: code });
+  };
+
+  const joinRoom = () => {
+    if (!socketRef.current) socketRef.current = io(SOCKET_IO);
+    socketRef.current.emit('join_room', { roomId });
+    setIsHost(false);
+  };
+
+  return (
+    <div className="app">
+      <h2>Hackathon — Spotify Shared Room (Demo)</h2>
+      {!accessToken ? (
+        <div style={{marginTop:20}}>
+          <p>Sign in with Spotify (redirects to Spotify login)</p>
+          <button className="btn primary" onClick={doLogin}>Sign in with Spotify</button>
+        </div>
+      ) : (
+        <div>
+          <div style={{marginTop:12}}>
+            <strong>Logged in (demo)</strong>
+            <div style={{marginTop:6}}>
+              <button className="btn" onClick={createRoom}>Create Room (become host)</button>
+              <span style={{marginLeft:12}}>or</span>
+              <input style={{marginLeft:12,padding:8,borderRadius:8}} placeholder="Room code" value={roomId} onChange={e=>setRoomId(e.target.value)} />
+              <button style={{marginLeft:8}} className="btn" onClick={joinRoom}>Join Room</button>
+            </div>
+          </div>
+
+          {joinedRoom && (
+            <div className="roomCard">
+              <div>Room: <strong>{joinedRoom}</strong> {isHost && <em>(You are host)</em>}</div>
+              <div style={{marginTop:8}}>
+                <div>Current Track: {currentTrack ? `${currentTrack.name} — ${currentTrack.artists}` : '—'}</div>
+                <div style={{marginTop:8}}>
+                  <small>Host will broadcast playback; clients will attempt to play the same track via Spotify Web API</small>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div style={{marginTop:12}}>
+            <p><em>Notes for demo:</em></p>
+            <ol>
+              <li>Open this page in 2+ browsers & sign in with different Spotify accounts.</li>
+              <li>One user creates a room (host) and starts playing a track in their Spotify Web Player or device.</li>
+              <li>Host will broadcast and others will attempt to start the same track (best-effort).</li>
+            </ol>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+    "vite": "^5.2.0",
+    "@vitejs/plugin-react": "^4.0.0"
+  }
+}
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+import './styles.css';
+createRoot(document.getElementById('root')).render(<App />);
+body{font-family:Inter,system-ui,Arial; margin:0; background:#f6f7fb;}
+.app{max-width:900px;margin:40px auto;padding:20px;background:white;border-radius:12px;box-shadow:0 6px 18px rgba(15,23,42,0.06);}
+.btn{padding:8px 12px;border-radius:8px;border:1px solid #e6e9f2;background:#fff;cursor:pointer;}
+.btn.primary{background:#6366f1;color:white;border:none;}
+.roomCard{border:1px dashed #e3e7ff;padding:12px;border-radius:10px;margin-top:12px;}
+import React, { useEffect, useState, useRef } from 'react';
+import io from 'socket.io-client';
+import axios from 'axios';
+
+/* configure */
+const SERVER = 'http://localhost:8888'; // server base
+const SOCKET_IO = 'http://localhost:8888'; // socket server origin
+
+function useQueryParams() {
+  const [params, setParams] = useState({});
+  useEffect(()=> {
+    const qs = new URLSearchParams(window.location.search);
+    const obj = {};
+    for (const [k,v] of qs.entries()) obj[k] = v;
+    setParams(obj);
+  }, []);
+  return params;
+}
+
+export default function App(){
+  const qp = useQueryParams();
+  const [accessToken, setAccessToken] = useState(qp.access_token || null);
+  const [refreshToken, setRefreshToken] = useState(qp.refresh_token || null);
+  const [roomId, setRoomId] = useState('');
+  const [joinedRoom, setJoinedRoom] = useState(null);
+  const [isHost, setIsHost] = useState(false);
+  const socketRef = useRef(null);
+  const playerRef = useRef(null);
+  const [status, setStatus] = useState('idle');
+  const [currentTrack, setCurrentTrack] = useState(null);
+
+  useEffect(()=> {
+    if (!socketRef.current) socketRef.current = io(SOCKET_IO);
+    const sock = socketRef.current;
+    sock.on('room_created', d => setJoinedRoom(d.roomId));
+    sock.on('joined_room', d => setJoinedRoom(d.roomId));
+    sock.on('sync_update', async ({ trackId, progress_ms, isPlaying, ts }) => {
+      // simple best-effort: use Web API to play/seek if token available
+      if (!accessToken) return;
+      try {
+        // If different track, start playing that track for this user
+        // Start playing the track on user's active device (or default device)
+        await axios.put(`https://api.spotify.com/v1/me/player/play`, 
+          { uris: [`spotify:track:${trackId}`], position_ms: progress_ms },
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        ).catch(()=>{}); // best-effort (some accounts/devices might not allow)
+      } catch (err) {
+        console.log('sync play failed', err?.response?.data || err.message);
+      }
+    });
+    return ()=> { sock.disconnect(); socketRef.current = null; };
+  }, [accessToken]);
+
+  /* Web Playback SDK loader + player init */
+  useEffect(()=> {
+    if (!accessToken) return;
+    const script = document.createElement('script');
+    script.src = "https://sdk.scdn.co/spotify-player.js";
+    script.async = true;
+    document.body.appendChild(script);
+
+    window.onSpotifyWebPlaybackSDKReady = () => {
+      const player = new window.Spotify.Player({
+        name: 'Hackathon Shared Room Player',
+        getOAuthToken: cb => { cb(accessToken); },
+        volume: 0.6
+      });
+      playerRef.current = player;
+
+      player.addListener('ready', ({ device_id }) => {
+        console.log('ready device_id', device_id);
+        setStatus('device_ready');
+        // Note: In demo we don't auto transfer — user can open Spotify and play
+      });
+
+      player.addListener('player_state_changed', state => {
+        if (!state) return;
+        const track = state.track_window.current_track;
+        setCurrentTrack({ id: track.id, name: track.name, artists: track.artists.map(a=>a.name).join(',') });
+      });
+
+      player.connect();
+    };
+
+    return () => {
+      // cleanup script if needed
+    };
+  }, [accessToken]);
+
+  useEffect(()=> {
+    // if this client is host, emit host updates periodically
+    let iv;
+    if (isHost && socketRef.current && playerRef.current) {
+      iv = setInterval(async ()=> {
+        try {
+          const state = await playerRef.current.getCurrentState();
+          if (!state) return;
+          const track = state.track_window.current_track;
+          socketRef.current.emit('host_update', {
+            roomId: joinedRoom,
+            trackId: track.id,
+            progress_ms: state.position,
+            isPlaying: !state.paused,
+            ts: Date.now()
+          });
+        } catch (e) {
+          // ignore
+        }
+      }, 1000);
+    }
+    return ()=> clearInterval(iv);
+  }, [isHost, joinedRoom]);
+
+  const doLogin = () => window.location.href = `${SERVER}/login`;
+
+  const createRoom = () => {
+    if (!socketRef.current) socketRef.current = io(SOCKET_IO);
+    const code = Math.random().toString(36).slice(2,8).toUpperCase();
+    setIsHost(true);
+    socketRef.current.emit('create_room', { roomId: code });
+  };
+
+  const joinRoom = () => {
+    if (!socketRef.current) socketRef.current = io(SOCKET_IO);
+    socketRef.current.emit('join_room', { roomId });
+    setIsHost(false);
+  };
+
+  return (
+    <div className="app">
+      <h2>Hackathon — Spotify Shared Room (Demo)</h2>
+      {!accessToken ? (
+        <div style={{marginTop:20}}>
+          <p>Sign in with Spotify (redirects to Spotify login)</p>
+          <button className="btn primary" onClick={doLogin}>Sign in with Spotify</button>
+        </div>
+      ) : (
+        <div>
+          <div style={{marginTop:12}}>
+            <strong>Logged in (demo)</strong>
+            <div style={{marginTop:6}}>
+              <button className="btn" onClick={createRoom}>Create Room (become host)</button>
+              <span style={{marginLeft:12}}>or</span>
+              <input style={{marginLeft:12,padding:8,borderRadius:8}} placeholder="Room code" value={roomId} onChange={e=>setRoomId(e.target.value)} />
+              <button style={{marginLeft:8}} className="btn" onClick={joinRoom}>Join Room</button>
+            </div>
+          </div>
+
+          {joinedRoom && (
+            <div className="roomCard">
+              <div>Room: <strong>{joinedRoom}</strong> {isHost && <em>(You are host)</em>}</div>
+              <div style={{marginTop:8}}>
+                <div>Current Track: {currentTrack ? `${currentTrack.name} — ${currentTrack.artists}` : '—'}</div>
+                <div style={{marginTop:8}}>
+                  <small>Host will broadcast playback; clients will attempt to play the same track via Spotify Web API</small>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div style={{marginTop:12}}>
+            <p><em>Notes for demo:</em></p>
+            <ol>
+              <li>Open this page in 2+ browsers & sign in with different Spotify accounts.</li>
+              <li>One user creates a room (host) and starts playing a track in their Spotify Web Player or device.</li>
+              <li>Host will broadcast and others will attempt to start the same track (best-effort).</li>
+            </ol>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+cd server
+npm install
+npm run dev
+cd client
+npm install
+npm run dev
+# Vite will show the client address (default http://localhost:3000)
